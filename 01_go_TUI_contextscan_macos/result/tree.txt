@@ -1,0 +1,26 @@
+airflow_pipeline_yh
+└── .env
+├── dags/
+│   └── yahoo_pipeline.py
+├── data/
+│   └── 1min_scheduled__2026-06-27T00:05:00+00:00.json
+│   └── 1min_scheduled__2026-06-27T00:10:00+00:00.json
+│   └── 1min_scheduled__2026-06-27T00:15:00+00:00.json
+│   └── 5min_scheduled__2026-06-27T00:05:00+00:00.json
+│   └── 5min_scheduled__2026-06-27T00:10:00+00:00.json
+│   └── 5min_scheduled__2026-06-27T00:15:00+00:00.json
+│   └── fundamental_scheduled__2026-06-27T00:05:00+00:00.json
+│   └── fundamental_scheduled__2026-06-27T00:10:00+00:00.json
+│   └── fundamental_scheduled__2026-06-27T00:15:00+00:00.json
+└── docker-compose.yml
+└── init.sql
+├── notebooks/
+│   ├── yahoo_exploration/
+│   │   └── yhfin_explo.ipynb
+└── requirements.txt
+├── scripts/
+│   └── config.py
+│   └── db_utils.py
+│   └── yahoo_utils.py
+└── start.sh
+└── stop.sh

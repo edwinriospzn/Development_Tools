@@ -1,0 +1,1076 @@
+=== .env ===
+AIRFLOW_UID=50000
+AIRFLOW_GID=50000
+
+
+=== dags/yahoo_pipeline.py ===
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator, ShortCircuitOperator  # ← Importar ShortCircuitOperator
+import sys
+import json
+import os
+import logging
+sys.path.append('/opt/airflow/scripts')
+
+from yahoo_utils import fetch_intraday_data, fetch_fundamental_data
+from db_utils import insert_intraday, insert_fundamental
+
+DATA_DIR = '/opt/airflow/data'
+
+default_args = {
+    'owner': 'data_engineer',
+    'start_date': datetime(2026, 1, 1),
+    'retries': 2,
+    'retry_delay': timedelta(minutes=1),
+}
+
+# ============================================
+# FUNCIONES LOAD (Leer desde archivos)
+# ============================================
+
+def load_data_1min(**context):
+    run_id = context['run_id']
+    file_path = f"{DATA_DIR}/1min_{run_id}.json"
+    logging.info(f"📂 Buscando archivo: {file_path}")
+    
+    if os.path.exists(file_path):
+        with open(file_path, 'r') as f:
+            records = json.load(f)
+        if records:
+            insert_intraday(records, 'raw_intraday_1min')
+            logging.info(f"✅ Cargados {len(records)} registros de 1min")
+            os.remove(file_path)
+        else:
+            logging.warning("⚠️ Archivo vacío, sin datos para insertar")
+    else:
+        raise ValueError(f"Archivo no encontrado: {file_path}")
+
+def load_data_5min(**context):
+    run_id = context['run_id']
+    file_path = f"{DATA_DIR}/5min_{run_id}.json"
+    logging.info(f"📂 Buscando archivo: {file_path}")
+    
+    if os.path.exists(file_path):
+        with open(file_path, 'r') as f:
+            records = json.load(f)
+        if records:
+            insert_intraday(records, 'raw_intraday_5min')
+            logging.info(f"✅ Cargados {len(records)} registros de 5min")
+            os.remove(file_path)
+        else:
+            logging.warning("⚠️ Archivo vacío, sin datos para insertar")
+    else:
+        raise ValueError(f"Archivo no encontrado: {file_path}")
+
+def load_fundamental_data(**context):
+    run_id = context['run_id']
+    file_path = f"{DATA_DIR}/fundamental_{run_id}.json"
+    logging.info(f"📂 Buscando archivo: {file_path}")
+    
+    if os.path.exists(file_path):
+        with open(file_path, 'r') as f:
+            records = json.load(f)
+        if records:
+            insert_fundamental(records)
+            logging.info(f"✅ Cargados {len(records)} registros fundamentales")
+            os.remove(file_path)
+        else:
+            logging.warning("⚠️ Archivo vacío, sin datos para insertar")
+    else:
+        raise ValueError(f"Archivo no encontrado: {file_path}")
+
+# ============================================
+# FUNCIONES PARA FILTRAR POR TIEMPO (¡NUEVO!)
+# ============================================
+
+def should_run_5min(**context):
+    """Solo ejecuta si el minuto actual es múltiplo de 5"""
+    from datetime import datetime
+    current_minute = datetime.now().minute
+    should_run = current_minute % 5 == 0
+    logging.info(f"🕐 Minuto {current_minute}: ejecutar 5min = {should_run}")
+    return should_run
+
+def should_run_15min(**context):
+    """Solo ejecuta si el minuto actual es múltiplo de 15"""
+    from datetime import datetime
+    current_minute = datetime.now().minute
+    should_run = current_minute % 15 == 0
+    logging.info(f"🕐 Minuto {current_minute}: ejecutar fundamental = {should_run}")
+    return should_run
+
+# ============================================
+# DAG
+# ============================================
+
+dag = DAG(
+    'yahoo_pipeline',
+    default_args=default_args,
+    description='Pipeline Yahoo Finance: 1min, 5min y fundamentales',
+    schedule_interval='*/1 * * * *',  # Cada 1 minuto
+    catchup=False,
+    max_active_runs=1,
+    tags=['yahoo', 'finance']
+)
+
+# ============================================
+# TAREAS FETCH
+# ============================================
+
+fetch_1min = PythonOperator(
+    task_id='fetch_1min',
+    python_callable=fetch_intraday_data,
+    op_kwargs={'frequency': '1min'},
+    provide_context=True,
+    dag=dag,
+)
+
+fetch_5min = PythonOperator(
+    task_id='fetch_5min',
+    python_callable=fetch_intraday_data,
+    op_kwargs={'frequency': '5min'},
+    provide_context=True,
+    dag=dag,
+)
+
+fetch_fund = PythonOperator(
+    task_id='fetch_fundamental',
+    python_callable=fetch_fundamental_data,
+    provide_context=True,
+    dag=dag,
+)
+
+# ============================================
+# TAREAS LOAD
+# ============================================
+
+load_1min = PythonOperator(
+    task_id='load_1min',
+    python_callable=load_data_1min,
+    provide_context=True,
+    dag=dag,
+)
+
+load_5min = PythonOperator(
+    task_id='load_5min',
+    python_callable=load_data_5min,
+    provide_context=True,
+    dag=dag,
+)
+
+load_fund = PythonOperator(
+    task_id='load_fundamental',
+    python_callable=load_fundamental_data,
+    provide_context=True,
+    dag=dag,
+)
+
+# ============================================
+# TAREAS DE CONTROL (ShortCircuit) - ¡NUEVO!
+# ============================================
+
+check_5min = ShortCircuitOperator(
+    task_id='check_5min',
+    python_callable=should_run_5min,
+    provide_context=True,
+    dag=dag,
+)
+
+check_15min = ShortCircuitOperator(
+    task_id='check_15min',
+    python_callable=should_run_15min,
+    provide_context=True,
+    dag=dag,
+)
+
+# ============================================
+# DEPENDENCIAS
+# ============================================
+
+# 1min: siempre se ejecuta
+fetch_1min >> load_1min
+
+# 5min: solo si check_5min retorna True
+check_5min >> fetch_5min >> load_5min
+
+# Fundamental: solo si check_15min retorna True
+check_15min >> fetch_fund >> load_fund
+
+=== data/1min_scheduled__2026-06-27T00:05:00+00:00.json ===
+[]
+
+=== data/1min_scheduled__2026-06-27T00:10:00+00:00.json ===
+[]
+
+=== data/1min_scheduled__2026-06-27T00:15:00+00:00.json ===
+[]
+
+=== data/5min_scheduled__2026-06-27T00:05:00+00:00.json ===
+[]
+
+=== data/5min_scheduled__2026-06-27T00:10:00+00:00.json ===
+[]
+
+=== data/5min_scheduled__2026-06-27T00:15:00+00:00.json ===
+[]
+
+=== data/fundamental_scheduled__2026-06-27T00:05:00+00:00.json ===
+[]
+
+=== data/fundamental_scheduled__2026-06-27T00:10:00+00:00.json ===
+[]
+
+=== data/fundamental_scheduled__2026-06-27T00:15:00+00:00.json ===
+[]
+
+=== docker-compose.yml ===
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5455:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    ports:
+      - "6390:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  airflow-build:
+    build: .
+    image: airflow-custom:latest
+    command: echo "Imagen construida"
+    depends_on:
+      - postgres
+      - redis
+
+  airflow-webserver:
+    image: airflow-custom:latest
+    command: webserver
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__WEBSERVER__RBAC: 'True'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data   # ← NUEVO
+    ports:
+      - "8090:8080"
+    depends_on:
+      - postgres
+      - redis
+      - airflow-build
+
+  airflow-scheduler:
+    image: airflow-custom:latest
+    command: scheduler
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres:5432/airflow
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data   # ← NUEVO
+    depends_on:
+      - postgres
+      - redis
+      - airflow-webserver
+
+  airflow-worker:
+    image: airflow-custom:latest
+    command: celery worker
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres:5432/airflow
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data   # ← NUEVO
+    depends_on:
+      - postgres
+      - redis
+      - airflow-webserver
+    deploy:
+      replicas: 2
+
+volumes:
+  postgres_data:
+
+=== init.sql ===
+-- Tabla 1min
+CREATE TABLE IF NOT EXISTS raw_intraday_1min (
+    id SERIAL PRIMARY KEY,
+    ticker VARCHAR(20) NOT NULL,
+    timestamp TIMESTAMP NOT NULL,
+    open DECIMAL(12,4),
+    high DECIMAL(12,4),
+    low DECIMAL(12,4),
+    close DECIMAL(12,4),
+    volume BIGINT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(ticker, timestamp)
+);
+
+-- Tabla 5min
+CREATE TABLE IF NOT EXISTS raw_intraday_5min (
+    id SERIAL PRIMARY KEY,
+    ticker VARCHAR(20) NOT NULL,
+    timestamp TIMESTAMP NOT NULL,
+    open DECIMAL(12,4),
+    high DECIMAL(12,4),
+    low DECIMAL(12,4),
+    close DECIMAL(12,4),
+    volume BIGINT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(ticker, timestamp)
+);
+
+-- Tabla fundamental
+CREATE TABLE IF NOT EXISTS raw_fundamental (
+    id SERIAL PRIMARY KEY,
+    ticker VARCHAR(20) NOT NULL,
+    fetch_timestamp TIMESTAMP NOT NULL,
+    market_cap BIGINT,
+    trailing_pe DECIMAL(10,2),
+    dividend_yield DECIMAL(8,4),
+    sector VARCHAR(100),
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(ticker, fetch_timestamp)
+);
+
+-- Índices
+CREATE INDEX IF NOT EXISTS idx_1min_ticker_time ON raw_intraday_1min(ticker, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_5min_ticker_time ON raw_intraday_5min(ticker, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_fundamental_ticker_time ON raw_fundamental(ticker, fetch_timestamp DESC);
+
+=== notebooks/yahoo_exploration/yhfin_explo.ipynb ===
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "0b60fc50",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Price                      Date ticker        Open        High         Low  \\\n",
+      "0     2026-06-26 09:30:00-04:00   AAPL  275.000000  275.429993  274.209991   \n",
+      "1     2026-06-26 09:31:00-04:00   AAPL  275.214996  277.510010  275.170013   \n",
+      "2     2026-06-26 09:32:00-04:00   AAPL  277.225006  278.000000  276.690002   \n",
+      "3     2026-06-26 09:33:00-04:00   AAPL  276.779999  276.779999  275.970093   \n",
+      "4     2026-06-26 09:34:00-04:00   AAPL  276.214996  276.989899  275.769989   \n",
+      "\n",
+      "Price       Close   Volume  \n",
+      "0      275.214996  2825462  \n",
+      "1      277.225006   560589  \n",
+      "2      276.769989   459039  \n",
+      "3      276.214996   304924  \n",
+      "4      276.929993   306804  \n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/tmp/ipykernel_67618/2016578616.py:16: FutureWarning: The previous implementation of stack is deprecated and will be removed in a future version of pandas. See the What's New notes for pandas 2.1.0 for details. Specify future_stack=True to adopt the new implementation and silence this warning.\n",
+      "  df = df.stack(level=0).rename_axis(index=[\"Date\", \"ticker\"]).reset_index()\n"
+     ]
+    }
+   ],
+   "source": [
+    "import yfinance as yf\n",
+    "import pandas as pd\n",
+    "\n",
+    "tickers = [\"AAPL\"]#, \"NVDA\"]\n",
+    "\n",
+    "df = yf.download(\n",
+    "    tickers=tickers,\n",
+    "    period=\"1d\",\n",
+    "    interval=\"1m\",\n",
+    "    group_by=\"ticker\",\n",
+    "    progress=False\n",
+    ")\n",
+    "\n",
+    "# Convert to long format with a ticker column\n",
+    "if isinstance(df.columns, pd.MultiIndex):\n",
+    "    df = df.stack(level=0).rename_axis(index=[\"Date\", \"ticker\"]).reset_index()\n",
+    "\n",
+    "# Optional: keep only the columns you want\n",
+    "# df = df[[\"Date\", \"ticker\", \"Close\"]]\n",
+    "\n",
+    "print(df.head())"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "c9c7baf2",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "390"
+      ]
+     },
+     "execution_count": 7,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(df)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "2b008d70",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "AAPL\n",
+      "Market Cap: 4124944105472\n",
+      "PE Ratio: 34.042423\n",
+      "Dividend Yield: 0.39\n",
+      "Sector: Technology\n",
+      "----------------------------------------\n",
+      "NVDA\n",
+      "Market Cap: 4698508099584\n",
+      "PE Ratio: 29.661299\n",
+      "Dividend Yield: 0.51\n",
+      "Sector: Technology\n",
+      "----------------------------------------\n"
+     ]
+    },
+    {
+     "data": {
+      "application/vnd.microsoft.datawrangler.viewer.v0+json": {
+       "columns": [
+        {
+         "name": "index",
+         "rawType": "int64",
+         "type": "integer"
+        },
+        {
+         "name": "ticker",
+         "rawType": "object",
+         "type": "string"
+        },
+        {
+         "name": "marketCap",
+         "rawType": "int64",
+         "type": "integer"
+        },
+        {
+         "name": "trailingPE",
+         "rawType": "float64",
+         "type": "float"
+        },
+        {
+         "name": "dividendYield",
+         "rawType": "float64",
+         "type": "float"
+        },
+        {
+         "name": "sector",
+         "rawType": "object",
+         "type": "string"
+        }
+       ],
+       "ref": "3a0c7974-7e80-40a5-978c-1ec05cc3f340",
+       "rows": [
+        [
+         "0",
+         "AAPL",
+         "4124944105472",
+         "34.042423",
+         "0.39",
+         "Technology"
+        ],
+        [
+         "1",
+         "NVDA",
+         "4698508099584",
+         "29.661299",
+         "0.51",
+         "Technology"
+        ]
+       ],
+       "shape": {
+        "columns": 5,
+        "rows": 2
+       }
+      },
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>ticker</th>\n",
+       "      <th>marketCap</th>\n",
+       "      <th>trailingPE</th>\n",
+       "      <th>dividendYield</th>\n",
+       "      <th>sector</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>0</th>\n",
+       "      <td>AAPL</td>\n",
+       "      <td>4124944105472</td>\n",
+       "      <td>34.042423</td>\n",
+       "      <td>0.39</td>\n",
+       "      <td>Technology</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1</th>\n",
+       "      <td>NVDA</td>\n",
+       "      <td>4698508099584</td>\n",
+       "      <td>29.661299</td>\n",
+       "      <td>0.51</td>\n",
+       "      <td>Technology</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "  ticker      marketCap  trailingPE  dividendYield      sector\n",
+       "0   AAPL  4124944105472   34.042423           0.39  Technology\n",
+       "1   NVDA  4698508099584   29.661299           0.51  Technology"
+      ]
+     },
+     "execution_count": 7,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "import yfinance as yf\n",
+    "\n",
+    "# Example: get fundamental data for each ticker\n",
+    "for ticker in [\"AAPL\", \"NVDA\"]:\n",
+    "    stock = yf.Ticker(ticker)\n",
+    "    info = stock.info\n",
+    "    print(ticker)\n",
+    "    print(\"Market Cap:\", info.get(\"marketCap\"))\n",
+    "    print(\"PE Ratio:\", info.get(\"trailingPE\"))\n",
+    "    print(\"Dividend Yield:\", info.get(\"dividendYield\"))\n",
+    "    print(\"Sector:\", info.get(\"sector\"))\n",
+    "    print(\"-\" * 40)\n",
+    "\n",
+    "# If you want a table, collect them into a DataFrame\n",
+    "fundamentals = []\n",
+    "for ticker in [\"AAPL\", \"NVDA\"]:\n",
+    "    stock = yf.Ticker(ticker)\n",
+    "    info = stock.info\n",
+    "    fundamentals.append({\n",
+    "        \"ticker\": ticker,\n",
+    "        \"marketCap\": info.get(\"marketCap\"),\n",
+    "        \"trailingPE\": info.get(\"trailingPE\"),\n",
+    "        \"dividendYield\": info.get(\"dividendYield\"),\n",
+    "        \"sector\": info.get(\"sector\")\n",
+    "    })\n",
+    "\n",
+    "fundamentals_df = pd.DataFrame(fundamentals)\n",
+    "fundamentals_df"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "id": "2da09b23",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "1.4.1\n"
+     ]
+    }
+   ],
+   "source": [
+    "print(yf.__version__)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "79ba87fc",
+   "metadata": {},
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "a7381fdf",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "base",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.13.9"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+
+
+=== requirements.txt ===
+apache-airflow==2.7.1
+yfinance==1.4.1
+pandas==2.0.3
+psycopg2-binary==2.9.9
+
+=== scripts/config.py ===
+# Variables globales
+TICKERS = ["AAPL", "NVDA", "MSFT", "GOOGL", "AMZN"]
+
+# Columnas fundamentales
+FUNDAMENTAL_COLUMNS = [
+    "marketCap", "trailingPE", "dividendYield", "sector"
+]
+
+=== scripts/db_utils.py ===
+import psycopg2
+import logging
+
+DB_CONFIG = {
+    'host': 'postgres',
+    'port': 5432,
+    'database': 'airflow',
+    'user': 'airflow',
+    'password': 'airflow'
+}
+
+def get_connection():
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        return conn
+    except Exception as e:
+        logging.error(f"❌ Error conectando a PostgreSQL: {e}")
+        raise
+
+def insert_intraday(records, table_name):
+    """Inserta datos en raw_intraday_1min o raw_intraday_5min"""
+    if not records:
+        logging.warning(f"⚠️ No hay registros para insertar en {table_name}")
+        return
+    
+    conn = None
+    cur = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        inserted = 0
+        for row in records:
+            try:
+                # ⭐ USAR MINÚSCULAS (open, high, low, close, volume)
+                cur.execute(f"""
+                    INSERT INTO {table_name} (ticker, timestamp, open, high, low, close, volume)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (ticker, timestamp) DO NOTHING
+                """, (
+                    row.get('ticker'),
+                    row.get('timestamp'),
+                    row.get('open'),      # ← minúscula
+                    row.get('high'),      # ← minúscula
+                    row.get('low'),       # ← minúscula
+                    row.get('close'),     # ← minúscula
+                    row.get('volume')     # ← minúscula
+                ))
+                inserted += 1
+            except Exception as e:
+                logging.error(f"Error insertando fila: {e}")
+                logging.error(f"Row: {row}")
+        
+        conn.commit()
+        logging.info(f"✅ Insertados {inserted} registros en {table_name}")
+        
+    except Exception as e:
+        logging.error(f"❌ Error en insert_intraday: {e}")
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+def insert_fundamental(records):
+    """Inserta datos fundamentales"""
+    if not records:
+        logging.warning("⚠️ No hay registros fundamentales para insertar")
+        return
+    
+    conn = None
+    cur = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        inserted = 0
+        for row in records:
+            try:
+                cur.execute("""
+                    INSERT INTO raw_fundamental 
+                    (ticker, fetch_timestamp, market_cap, trailing_pe, dividend_yield, sector)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (ticker, fetch_timestamp) DO NOTHING
+                """, (
+                    row.get('ticker'),
+                    row.get('fetch_timestamp'),
+                    row.get('marketCap'),
+                    row.get('trailingPE'),
+                    row.get('dividendYield'),
+                    row.get('sector')
+                ))
+                inserted += 1
+            except Exception as e:
+                logging.error(f"Error insertando fila fundamental: {e}")
+        
+        conn.commit()
+        logging.info(f"✅ Insertados {inserted} registros en raw_fundamental")
+        
+    except Exception as e:
+        logging.error(f"❌ Error en insert_fundamental: {e}")
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+=== scripts/yahoo_utils.py ===
+import yfinance as yf
+import pandas as pd
+import logging
+import time
+import json
+import os
+from datetime import datetime, timedelta
+from config import TICKERS, FUNDAMENTAL_COLUMNS
+
+DATA_DIR = '/opt/airflow/data'
+
+def fetch_intraday_data(frequency, **context):
+    """
+    Obtiene el ÚLTIMO registro de cada ticker para la frecuencia indicada.
+    
+    frequency: '1min' o '5min'
+    """
+    interval = '1m' if frequency == '1min' else '5m'
+    
+    logging.info(f"📊 Descargando ÚLTIMO dato {frequency} para {TICKERS}")
+    
+    try:
+        # Descargar datos del día
+        df = yf.download(
+            tickers=TICKERS,
+            period='1d',           # Mínimo período permitido
+            interval=interval,
+            group_by='ticker',
+            progress=False,
+            auto_adjust=False
+        )
+        
+        if df.empty:
+            logging.warning(f"⚠️ No se descargaron datos para {frequency}")
+            records = []
+        else:
+            # Convertir a formato largo con columna 'ticker'
+            if isinstance(df.columns, pd.MultiIndex):
+                df = df.stack(level=0).rename_axis(index=['timestamp', 'ticker']).reset_index()
+            else:
+                # Si solo es un ticker, agregar columna
+                df = df.reset_index()
+                df['ticker'] = TICKERS[0] if TICKERS else 'AAPL'
+            
+            # ⭐ FILTRAR: QUEDARSE SOLO CON EL ÚLTIMO REGISTRO POR TICKER ⭐
+            df = df.groupby('ticker').tail(1).reset_index(drop=True)
+            
+            logging.info(f"✅ {frequency}: {len(df)} registros (últimos por ticker)")
+            
+            # Convertir timestamps a string para JSON
+            df['timestamp'] = df['timestamp'].astype(str)
+            
+            # Renombrar columnas para consistencia
+            df = df.rename(columns={
+                'Open': 'open',
+                'High': 'high',
+                'Low': 'low',
+                'Close': 'close',
+                'Volume': 'volume'
+            })
+            
+            records = df.to_dict('records')
+            
+    except Exception as e:
+        logging.error(f"❌ Error descargando {frequency}: {e}")
+        records = []
+    
+    # Guardar en archivo JSON
+    os.makedirs(DATA_DIR, exist_ok=True)
+    run_id = context['run_id']
+    file_path = f"{DATA_DIR}/{frequency}_{run_id}.json"
+    
+    with open(file_path, 'w') as f:
+        json.dump(records, f, default=str)
+    
+    logging.info(f"📁 Archivo guardado: {file_path} ({len(records)} registros)")
+    
+    # XCom para respaldo
+    try:
+        context['ti'].xcom_push(key=f'data_{frequency}', value=records)
+    except Exception as e:
+        logging.warning(f"⚠️ No se pudo enviar a XCom: {e}")
+    
+    return records
+
+
+def fetch_fundamental_data(**context):
+    """Obtiene datos fundamentales para cada ticker"""
+    fundamentals = []
+    os.makedirs(DATA_DIR, exist_ok=True)
+    run_id = context['run_id']
+    file_path = f"{DATA_DIR}/fundamental_{run_id}.json"
+    
+    logging.info(f"📊 Descargando datos fundamentales para {TICKERS}")
+    
+    for idx, ticker in enumerate(TICKERS):
+        try:
+            if idx > 0:
+                time.sleep(2)  # Pausa para evitar rate limiting
+            
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            
+            record = {
+                'ticker': ticker,
+                'fetch_timestamp': datetime.now().isoformat(),
+                **{k: info.get(k) for k in FUNDAMENTAL_COLUMNS}
+            }
+            fundamentals.append(record)
+            logging.info(f"✅ Fundamental: {ticker}")
+            
+        except Exception as e:
+            logging.error(f"❌ Error con {ticker}: {e}")
+    
+    # Guardar en archivo JSON
+    with open(file_path, 'w') as f:
+        json.dump(fundamentals, f, default=str)
+    
+    logging.info(f"✅ Fundamental: {len(fundamentals)} registros guardados")
+    return fundamentals
+
+=== start.sh ===
+
+#!/bin/bash
+echo "🚀 Iniciando Pipeline Yahoo Finance"
+
+# ============================================
+# 1. Crear carpetas y dar permisos
+# ============================================
+mkdir -p logs dags scripts plugins data
+sudo chmod -R 777 logs/ 2>/dev/null || true
+
+# ============================================
+# 2. Limpiar contenedores anteriores
+# ============================================
+echo "🧹 Limpiando contenedores anteriores..."
+docker compose down -v 2>/dev/null || true
+
+# ============================================
+# 3. Levantar SOLO bases de datos
+# ============================================
+echo "🚀 Levantando PostgreSQL y Redis..."
+docker compose up -d postgres redis
+
+echo "⏳ Esperando 15 segundos para que las bases de datos estén listas..."
+sleep 15
+
+# ============================================
+# 4. Inicializar base de datos (ANTES de los workers)
+# ============================================
+echo "🔄 Inicializando base de datos de Airflow..."
+docker compose run --rm -T airflow-webserver airflow db init
+
+# ============================================
+# 5. Crear usuario admin (ANTES de los workers)
+# ============================================
+echo "👤 Creando usuario admin..."
+docker compose run --rm -T airflow-webserver airflow users create \
+    --username admin \
+    --password admin123 \
+    --firstname Admin \
+    --lastname User \
+    --role Admin \
+    --email admin@example.com 2>/dev/null || echo "⚠️  Usuario ya existe"
+
+# ============================================
+# 6. Verificar usuario en DB
+# ============================================
+echo "🔍 Verificando usuario en base de datos..."
+docker compose exec -T postgres psql -U airflow -d airflow -c "SELECT id, username, email FROM ab_user;"
+
+# ============================================
+# 7. Ahora sí, levantar todos los servicios de Airflow
+# ============================================
+echo "🚀 Levantando Airflow (webserver, scheduler, workers)..."
+docker compose up -d
+
+echo "⏳ Esperando 20 segundos para que Airflow esté listo..."
+sleep 20
+
+# ============================================
+# 8. Verificar que el scheduler esté saludable
+# ============================================
+echo "🔍 Verificando estado del scheduler..."
+SCHEDULER_RETRY=0
+while [ $SCHEDULER_RETRY -lt 10 ]; do
+    HEALTH=$(docker compose exec -T airflow-webserver curl -s http://localhost:8080/health 2>/dev/null)
+    if echo "$HEALTH" | grep -q '"scheduler".*"status": "healthy"'; then
+        echo "✅ Scheduler está saludable"
+        break
+    fi
+    echo "⏳ Esperando scheduler... (intento $((SCHEDULER_RETRY+1))/10)"
+    sleep 5
+    SCHEDULER_RETRY=$((SCHEDULER_RETRY+1))
+done
+
+if [ $SCHEDULER_RETRY -eq 10 ]; then
+    echo "⚠️  Scheduler no respondió. Puedes verificar con: docker compose logs airflow-scheduler"
+fi
+
+# ============================================
+# 9. Test de conexión final
+# ============================================
+echo "🔍 Verificando conexión a Airflow..."
+
+MAX_RETRIES=12
+RETRY=0
+HTTP_CODE="000"
+
+while [ $RETRY -lt $MAX_RETRIES ]; do
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8090/health 2>/dev/null)
+    
+    if [ "$HTTP_CODE" = "200" ]; then
+        echo "✅ Airflow respondiendo correctamente (HTTP $HTTP_CODE)"
+        break
+    fi
+    
+    RETRY=$((RETRY+1))
+    echo "⏳ Esperando que Airflow responda... (intento $RETRY/$MAX_RETRIES)"
+    sleep 5
+done
+
+if [ "$HTTP_CODE" != "200" ]; then
+    echo "⚠️  No se pudo conectar a Airflow. Verifica logs:"
+    echo "   docker compose logs airflow-webserver --tail 30"
+fi
+
+# ============================================
+# 10. Mostrar información final
+# ============================================
+echo ""
+echo "=========================================="
+echo "✅ Pipeline Yahoo Finance listo!"
+echo "=========================================="
+echo ""
+echo "   🌐 Airflow UI: http://localhost:8090"
+echo "      (Si no carga, prueba con: http://127.0.0.1:8090)"
+echo ""
+echo "   👤 Usuario: admin"
+echo "   🔑 Contraseña: admin123"
+echo ""
+echo "   📊 PostgreSQL: localhost:5455"
+echo "   🔴 Redis: localhost:6390"
+echo ""
+echo "   📝 Ver logs: docker compose logs -f"
+echo "   🛑 Detener: ./stop.sh"
+echo ""
+echo "=========================================="
+docker compose ps
+
+=== stop.sh ===
+#!/bin/bash
+#chmod +x stop.sh
+echo "🛑 Deteniendo Pipeline Yahoo Finance"
+
+# Detener contenedores y eliminar volúmenes
+docker compose down -v
+
+# Eliminar imagen personalizada (opcional, para rebuild completo)
+docker rmi airflow-custom:latest 2>/dev/null || echo "⚠️  Imagen no encontrada"
+
+echo "✅ Limpieza completa: contenedores, volúmenes e imagen eliminados"
+echo "📌 Ejecuta ./start.sh para reconstruir todo desde cero"
+
